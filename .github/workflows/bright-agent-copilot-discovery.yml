@@ -300,6 +300,30 @@ jobs:
       #     convert_markdown: true
       #     attachments: ${{ env.REPORT_FILE }}
 
+      # ---- Surface Copilot usage (tokens + AI credits) in the run summary ----
+      # Copilot CLI prints a stats footer at the end of a non-interactive run (as long as
+      # the `-s/--silent` flag is NOT used): AI Credits (the org-billed unit), Tokens
+      # (up/down, with cached/written split), and the file-change count. It lands in
+      # $RUN_LOG via the `tee` above. Pull those lines out and put them in the job summary
+      # so the cost of a run is visible without downloading the artifact.
+      - name: Report Copilot usage
+        if: always()
+        run: |
+          {
+            echo "## Copilot usage (model: ${COPILOT_MODEL})"
+            echo ""
+            if [ -s "$RUN_LOG" ] && grep -qE "AI Credits|Tokens" "$RUN_LOG"; then
+              echo '```'
+              # The footer is a short block at the end of the log; grab those lines.
+              grep -aE "^(Changes|AI Credits|Tokens|Resume) " "$RUN_LOG" | tail -4
+              echo '```'
+              echo ""
+              echo "_AI Credits is the org-billed unit; convert to \$ by your Copilot plan's rate._"
+            else
+              echo "No Copilot usage footer found in the run log (agent step may have failed before any model call, or ran with --silent)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # ---- Keep the run log and the report as artifacts ----
       # Treat this artifact as sensitive: GitHub's secret masking applies to the console
       # stream, not to the bytes `tee` writes to a file, and the transcript contains the

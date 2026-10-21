@@ -1,0 +1,316 @@
+# .github/workflows/bright-agent-copilot-discovery.yml
+#
+# Runs the Bright "discovery" agent (bright-discovery) in GitHub Copilot CLI,
+# non-interactively, and keeps a markdown report of the attack surface it registered as a
+# build artifact. The agent reads the repo whitebox, brings the app up itself, reaches it
+# through a Repeater, and registers in Bright every operation the code defines - with
+# code-grounded parameter values - then reports what it could not register and why.
+#
+# Discovery only: the agent never scans (no `runScan`) and never edits the repository (it
+# leaves the working tree as it found it). The deliverable of a run is the uploaded
+# artifact: the run log plus the discovery report (registered entrypoints, auth map,
+# coverage gaps). Email delivery is wired but disabled below.
+#
+# Drop-in: works for any repository. The agent figures out how to start the app from the
+# repo. If your app needs a specific startup command (or runs on a URL you control), pass
+# that as free text through EXTRA_INSTRUCTIONS at run time instead of editing this file.
+#
+# Secrets / variables required (Settings -> Secrets and variables -> Actions):
+#   secret   BRIGHT_TOKEN        Bright API token. It must carry the `bot` scope on top of the
+#                                discovery scopes, because the agent runs a Repeater
+#                                (`npx @brightsec/cli repeater`) to reach the app it started.
+#                                A plain project-scoped key without `bot` fails at Repeater setup.
+#   variable BRIGHT_HOSTNAME     e.g. app.brightsec.com   (NO https:// prefix here)
+#   variable BRIGHT_PROJECT      optional: Bright project id or exact name. Required when the
+#                                token can see more than one project - the agent is instructed
+#                                never to pick on your behalf, and in -p mode nobody can answer.
+#   variable COPILOT_MODEL       optional: Copilot model id for runs without the `model` input
+#                                (e.g. scheduled runs). Precedence: `model` input, then this
+#                                variable, then auto. List the ids with `copilot help config`.
+#   (none for model auth) The Copilot CLI is billed to the organization: it authenticates
+#                                the model with the job's own GITHUB_TOKEN (${{ github.token }}),
+#                                which is constrained by `permissions:` below and requires
+#                                `copilot-requests: write`. No PAT secret is needed.
+#                                Alternative, if you cannot bill Copilot CLI to the org: add a
+#                                secret COPILOT_CLI_TOKEN (a GitHub PAT whose owner has a Copilot
+#                                plan) and pass it as COPILOT_GITHUB_TOKEN to the agent step
+#                                instead - then available models follow the PAT owner's plan.
+#
+# For emailing the report (email step is disabled below; set these only if you re-enable it):
+#   variable SMTP_SERVER         e.g. smtp.gmail.com
+#   variable SMTP_PORT           465 for implicit TLS, 587 for STARTTLS
+#   secret   SMTP_USERNAME       SMTP login
+#   secret   SMTP_PASSWORD       SMTP password / app password
+#   variable REPORT_EMAIL_FROM   sender address
+#   variable REPORT_EMAIL_TO     recipients, comma-separated
+
+name: Bright discovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      extra_instructions:
+        description: "Optional free-text for the agent (how to start the app, staging URL, login creds, Bright project name for org-wide tokens)."
+        required: false
+        default: ""
+      model:
+        description: "Copilot model id, must be allowed by the org's Copilot model policy. Allowed for NeuraLegion as of 2026-10-15: gpt-5.5, gpt-5.4, gpt-5.3-codex, claude-opus-4.8, claude-fable-5, claude-sonnet-5, auto. Empty = COPILOT_MODEL variable, else auto."
+        required: false
+        default: "auto"
+  # schedule:
+  #   - cron: "0 3 * * 1"      # weekly, Monday 03:00 UTC
+
+permissions:
+  contents: read               # discovery never writes to the repo
+  copilot-requests: write      # lets the job's GITHUB_TOKEN authenticate Copilot CLI (org-billed)
+
+# One discovery run per ref: two concurrent runs would fight over the same target and the
+# same Bright entrypoints.
+concurrency:
+  group: bright-discovery-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash                # bash -eo pipefail: a failing `copilot` is not hidden by `tee`
+
+jobs:
+  bright-discover:
+    runs-on: ubuntu-latest
+    # Discovery (start app + Repeater + register entrypoints) is shorter than a scan loop,
+    # but the job gets a little more room than the agent step so the log/report upload
+    # still runs if the agent hits its own limit.
+    timeout-minutes: 90
+
+    env:
+      BRIGHT_HOSTNAME: ${{ vars.BRIGHT_HOSTNAME }}
+      BRIGHT_TOKEN: ${{ secrets.BRIGHT_TOKEN }}
+      BRIGHT_PROJECT: ${{ vars.BRIGHT_PROJECT }}
+      EXTRA_INSTRUCTIONS: ${{ inputs.extra_instructions }}
+      COPILOT_CLI_VERSION: "1.0.96"   # pinned; bump deliberately
+      # The org model policy is an allowlist: unlisted ids fail with
+      # 'Model "<id>" from --model flag is not available'. `auto` lets the CLI pick an
+      # allowed model, which is why it is the default here (a fixed id like gpt-5.5 fails
+      # when it is not on the org-billed token's allowlist).
+      # `model` input -> COPILOT_MODEL repo variable -> auto. Inputs are empty on
+      # non-dispatch triggers (schedule), so the variable/default cover those.
+      COPILOT_MODEL: ${{ inputs.model || vars.COPILOT_MODEL || 'auto' }}
+      # PLUGIN_DIR, OUT_DIR, RUN_LOG and REPORT_FILE are set by the first step: the `runner`
+      # context (runner.temp) is not available in job-level `env`.
+
+    steps:
+      # Log and report live outside the repo: out of the diff, and out of reach of the
+      # agent's cleanup gate, which undoes paths a run added inside the repository.
+      # OUT_DIR is a dedicated directory, not $RUNNER_TEMP itself: Copilot CLI only lets the
+      # agent write outside the repo into dirs passed with --add-dir, and $RUNNER_TEMP also
+      # holds the plugin clone, which must not be added (see the agent step).
+      - name: Set run paths
+        run: |
+          OUT_DIR="$RUNNER_TEMP/bright-out"
+          mkdir -p "$OUT_DIR"
+          {
+            echo "PLUGIN_DIR=$RUNNER_TEMP/bright-ai-plugins"
+            echo "OUT_DIR=$OUT_DIR"
+            echo "RUN_LOG=$OUT_DIR/bright-discovery.log"
+            echo "REPORT_FILE=$OUT_DIR/bright-discovery-report.md"
+          } >> "$GITHUB_ENV"
+
+      # persist-credentials: false keeps the checkout token out of .git/config, so the
+      # agent running with --allow-all-tools cannot push with it.
+      - name: Checkout repo under test
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # ---- Install the Copilot CLI ----
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Copilot CLI
+        run: npm install -g "@github/copilot@${COPILOT_CLI_VERSION}"
+
+      # ---- Get the Bright plugin (always latest main) ----
+      # Deliberately unpinned: every run picks up the newest agent and skills. Note the
+      # tradeoff - the agent runs with --allow-all-tools, so whoever can move `main` changes
+      # what this workflow executes, and a plugin change can alter behavior between runs.
+      # The resolved commit is recorded below so a run can always be traced back to it.
+      - name: Clone Bright AI plugins
+        run: |
+          git clone --depth 1 \
+            https://github.com/NeuraLegion/bright-ai-plugins "$PLUGIN_DIR"
+
+          test -f "$PLUGIN_DIR/github-copilot/plugin.json"
+          test -f "$PLUGIN_DIR/github-copilot/agents/bright-discovery.agent.md"
+
+          PLUGIN_SHA="$(git -C "$PLUGIN_DIR" rev-parse HEAD)"
+          echo "PLUGIN_SHA=$PLUGIN_SHA" >> "$GITHUB_ENV"
+          echo "Bright plugin at $PLUGIN_SHA"
+
+      # ---- Register the Bright MCP server ----
+      # Copilot CLI does NOT expand ${VAR} inside MCP config, so let the shell expand it,
+      # and strip any scheme from the hostname to avoid https://https://...
+      # The registration is written to ~/.copilot/mcp-config.json and persists to the
+      # agent step below.
+      - name: Register Bright MCP server
+        run: |
+          HOST="${BRIGHT_HOSTNAME#https://}"; HOST="${HOST#http://}"; HOST="${HOST%/}"
+          copilot mcp add --transport http \
+            --header "Authorization: Api-Key $BRIGHT_TOKEN" \
+            brightsec "https://$HOST/mcp"
+          copilot mcp list
+
+      # ---- Run the discovery agent, non-interactively ----
+      # With --plugin-dir the agent is namespaced <plugin.json name>:<agent name>, i.e.
+      # bright-security:bright-discovery.
+      # The agent already knows how to analyze the repo, start the app, reach it through a
+      # Repeater, and register the attack surface; the prompt below only supplies what a -p
+      # run cannot ask a human for, and EXTRA_INSTRUCTIONS adds run-specific context on top.
+      #
+      # Do NOT add `--add-dir "$PLUGIN_DIR/github-copilot"` (or $RUNNER_TEMP, which contains
+      # it): that would also load the repo's .github/agents copies, whose MCP frontmatter
+      # carries unexpanded ${{ }} placeholders and would register a second, broken
+      # `brightsec` server.
+      #
+      # `--add-dir "$OUT_DIR"` IS required: --allow-all-tools does not cover paths, and in -p
+      # mode every write outside the repo (cwd) is auto-denied ("no one to approve"). Without
+      # it the agent cannot write $REPORT_FILE and falls back to its session-state folder.
+      - name: Bright discovery
+        id: agent
+        timeout-minutes: 75
+        env:
+          # Copilot CLI reads COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN. Using the
+          # COPILOT_* name authenticates the model without handing the agent's shell a
+          # token that `gh` or `git` would pick up automatically. Here it carries the job's
+          # own GITHUB_TOKEN, so Copilot CLI is billed to the organization; the token is
+          # scoped by `permissions:` above (needs `copilot-requests: write`).
+          COPILOT_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # Explicit, so this stays correct even if `defaults.run.shell` above is changed:
+          # without pipefail the `| tee` at the end would report tee's exit code.
+          set -o pipefail
+
+          # The agent's skills have documented "ask the user" branches (which Bright
+          # project, and how to start the app). In -p mode there is nobody to ask, so tell
+          # it to fail loudly instead of waiting, and keep the work inside the step timeout.
+          PROMPT="Discover this project with Bright: build the endpoint inventory whitebox"
+          PROMPT="$PROMPT from the source, start the app, reach it through a Repeater, and"
+          PROMPT="$PROMPT register every operation the code defines in Bright with"
+          PROMPT="$PROMPT code-grounded parameter values. This is discovery only: do NOT run"
+          PROMPT="$PROMPT any scan and do NOT edit the repository."
+          PROMPT="$PROMPT This is a non-interactive CI run: there is no user to ask."
+          PROMPT="$PROMPT If a decision needs input you cannot infer, stop and report it as a"
+          PROMPT="$PROMPT blocker instead of waiting for an answer."
+          if [ -n "${BRIGHT_PROJECT:-}" ]; then
+            PROMPT="$PROMPT Use Bright project '${BRIGHT_PROJECT}'."
+          fi
+          # The deliverable of this workflow is the report artifact, so be specific about
+          # where it goes and what must be in it. The path is outside the repository on
+          # purpose: it stays out of the diff and out of your cleanup.
+          PROMPT="$PROMPT As the final step, write a markdown report to the absolute path"
+          PROMPT="$PROMPT ${REPORT_FILE} and leave that file in place - do not delete it"
+          PROMPT="$PROMPT during cleanup. Include: the target and how it was run (or the"
+          PROMPT="$PROMPT supplied URL) and whether the built frontend was served; the"
+          PROMPT="$PROMPT registered attack surface (the register-entrypoints counts line,"
+          PROMPT="$PROMPT then each entrypoint ID with method, URL, stored parameter values"
+          PROMPT="$PROMPT and the response status Bright recorded); scan-risk entrypoints"
+          PROMPT="$PROMPT flagged as dangerous under fuzzing, one-line reason each; the"
+          PROMPT="$PROMPT discovery path with its discoveryId; duplicates merged and noise"
+          PROMPT="$PROMPT excluded; the auth map (public route groups, and each mechanism"
+          PROMPT="$PROMPT with its guard and auth object ID or request-carried credential);"
+          PROMPT="$PROMPT the Repeater ID; and coverage gaps by name with the evidence for"
+          PROMPT="$PROMPT each. For each registered entrypoint, a Bright cloud link built as"
+          PROMPT="$PROMPT https://${BRIGHT_HOSTNAME}/projects/<projectId>/entrypoints/<entrypointId>"
+          PROMPT="$PROMPT using the project id and the entrypoint ids verbatim as the API"
+          PROMPT="$PROMPT returned them - do not reformat or expand them. State explicitly"
+          PROMPT="$PROMPT that no scan was run. Do not paste credentials or full tokens into"
+          PROMPT="$PROMPT the report."
+          PROMPT="$PROMPT ${EXTRA_INSTRUCTIONS}"
+
+          echo "Copilot model: ${COPILOT_MODEL}"
+          copilot \
+            --plugin-dir "$PLUGIN_DIR/github-copilot" \
+            --agent bright-security:bright-discovery \
+            --model "$COPILOT_MODEL" \
+            --add-dir "$OUT_DIR" \
+            --allow-all-tools \
+            --log-level info \
+            -p "$PROMPT" \
+            2>&1 | tee "$RUN_LOG"
+
+      # ---- Recover the report if the agent could not write it to $REPORT_FILE ----
+      # When a write outside the repo is denied, the agent saves files to its Copilot CLI
+      # session folder (~/.copilot/session-state/<id>/files/), which dies with the runner.
+      # Copy the newest markdown file from there so the report still reaches the artifact.
+      - name: Recover report from Copilot session state
+        if: always()
+        run: |
+          if [ -s "$REPORT_FILE" ]; then
+            echo "Report is already at $REPORT_FILE"
+            exit 0
+          fi
+          FOUND="$(find "$HOME/.copilot/session-state" -path '*/files/*' -type f -name '*.md' \
+                     -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2- || true)"
+          if [ -n "$FOUND" ]; then
+            cp "$FOUND" "$REPORT_FILE"
+            echo "::warning::report recovered from Copilot session state: $FOUND"
+          else
+            echo "No markdown file in Copilot session state either."
+          fi
+
+      # ---- Guard: did the agent write a report? ----
+      # Separate step so a missing report is a visible warning rather than a confusing
+      # failure inside a later step.
+      - name: Check the agent wrote a report
+        id: report
+        if: always()
+        run: |
+          if [ -s "$REPORT_FILE" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Report is $(wc -c < "$REPORT_FILE") bytes:"
+            head -40 "$REPORT_FILE"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::agent produced no report at $REPORT_FILE - nothing to upload"
+          fi
+
+      # ---- Email the report (disabled) ----
+      # Email delivery is turned off: the run's results are kept only as the uploaded
+      # artifact below (run log + report). To re-enable, uncomment this step and set the
+      # SMTP_* / REPORT_EMAIL_* variables and SMTP_USERNAME / SMTP_PASSWORD secrets.
+      # The report would go out three ways: plain-text markdown as `body`, rendered HTML as
+      # `html_body` (convert_markdown applies to html_body only), and the .md attachment.
+      # Treat the recipients as trusted: the report names the live app's attack surface.
+      # REPORT_FILE comes from $GITHUB_ENV (set in "Set run paths"), so it is read through
+      # the `env` context; it lives in bright-out/, not directly in runner.temp.
+      # - name: Email the discovery report
+      #   if: always() && steps.report.outputs.exists == 'true'
+      #   uses: dawidd6/action-send-mail@v22
+      #   with:
+      #     server_address: ${{ vars.SMTP_SERVER }}
+      #     server_port: ${{ vars.SMTP_PORT }}
+      #     username: ${{ secrets.SMTP_USERNAME }}
+      #     password: ${{ secrets.SMTP_PASSWORD }}
+      #     from: Bright discovery <${{ vars.REPORT_EMAIL_FROM }}>
+      #     to: ${{ vars.REPORT_EMAIL_TO }}
+      #     subject: "Bright discovery report: ${{ github.repository }} (run ${{ github.run_id }}, agent ${{ steps.agent.outcome }})"
+      #     body: file://${{ env.REPORT_FILE }}
+      #     html_body: file://${{ env.REPORT_FILE }}
+      #     convert_markdown: true
+      #     attachments: ${{ env.REPORT_FILE }}
+
+      # ---- Keep the run log and the report as artifacts ----
+      # Treat this artifact as sensitive: GitHub's secret masking applies to the console
+      # stream, not to the bytes `tee` writes to a file, and the transcript contains the
+      # app's attack surface plus whatever credentials the agent used to log into the app.
+      # Hence the short retention.
+      - name: Upload run log and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bright-discovery-log
+          # Whole OUT_DIR: run log, report, and anything else the agent left there.
+          path: ${{ runner.temp }}/bright-out/
+          if-no-files-found: warn
+          retention-days: 7

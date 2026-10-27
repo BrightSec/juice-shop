@@ -4,13 +4,58 @@
  */
 
 import { type Request, type Response, type NextFunction } from 'express'
+import { Op } from 'sequelize'
 import { BasketItemModel } from '../models/basketitem'
+import { BasketModel } from '../models/basket'
 import { QuantityModel } from '../models/quantity'
 import * as challengeUtils from '../lib/challengeUtils'
 
 import * as utils from '../lib/utils'
 import { challenges } from '../data/datacache'
 import * as security from '../lib/insecurity'
+
+export function getBasketItems () {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = security.authenticatedUsers.from(req)
+      if (!user?.data?.id) {
+        res.status(404).json({ status: 'success', data: [] })
+        return
+      }
+
+      const baskets = await BasketModel.findAll({ where: { UserId: user.data.id }, attributes: ['id'] })
+      const items = await BasketItemModel.findAll({
+        where: { BasketId: { [Op.in]: baskets.map(basket => basket.id) } }
+      })
+      res.json({ status: 'success', data: items })
+    } catch (error) {
+      next(error)
+    }
+  }
+}
+
+export function getBasketItemById () {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = security.authenticatedUsers.from(req)
+      const item = await BasketItemModel.findByPk(req.params.id)
+      if (!user?.data?.id || !item) {
+        res.status(404).json({ status: 'error', error: 'Not found' })
+        return
+      }
+
+      const basket = await BasketModel.findOne({ where: { id: item.BasketId, UserId: user.data.id } })
+      if (!basket) {
+        res.status(404).json({ status: 'error', error: 'Not found' })
+        return
+      }
+
+      res.json({ status: 'success', data: item })
+    } catch (error) {
+      next(error)
+    }
+  }
+}
 
 interface RequestWithRawBody extends Request {
   rawBody: string

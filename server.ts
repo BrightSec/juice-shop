@@ -370,12 +370,27 @@ restoreOverwrittenFilesWithOriginals().then(() => {
   /* BasketItems: API only accessible for authenticated users */
   app.use('/api/BasketItems', security.isAuthorized())
   app.use('/api/BasketItems/:id', security.isAuthorized())
+  app.get('/api/BasketItems', basketItems.getBasketItems())
+  app.get('/api/BasketItems/:id', basketItems.getBasketItemById())
   /* Feedbacks: GET allowed for feedback carousel, POST allowed in order to provide feedback without being logged in */
   app.use('/api/Feedbacks/:id', security.isAuthorized())
+  app.get('/api/Feedbacks/:id', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const user = security.authenticatedUsers.from(req)
+      const feedback = await FeedbackModel.findByPk(req.params.id)
+      if (!user || !feedback || feedback.UserId !== user.data.id) {
+        res.status(404).json({ error: 'Not found' })
+        return
+      }
+      next()
+    } catch (error) {
+      next(error)
+    }
+  })
   /* Users: Only POST is allowed in order to register a new user */
-  app.get('/api/Users', security.isAuthorized())
+  app.get('/api/Users', security.denyAll())
   app.route('/api/Users/:id')
-    .get(security.isAuthorized())
+    .get(security.denyAll())
     .put(security.denyAll())
     .delete(security.denyAll())
   /* Products: Only GET is allowed in order to view products */ // vuln-code-snippet neutral-line changeProductChallenge
@@ -449,13 +464,28 @@ restoreOverwrittenFilesWithOriginals().then(() => {
   app.delete('/api/Cards/:id', security.appendUserId(), payment.delPaymentMethodById())
   app.get('/api/Cards/:id', security.appendUserId(), payment.getPaymentMethodById())
   /* PrivacyRequests: Only POST allowed for authenticated users */
-  app.post('/api/PrivacyRequests', security.isAuthorized())
+  app.post('/api/PrivacyRequests', security.isAuthorized(), (req: Request, res: Response, next: NextFunction) => {
+    const user = security.authenticatedUsers.get(utils.jwtFrom(req))
+    if (!user?.data?.id) {
+      res.status(401).json({ status: 'error', message: 'Unauthorized' })
+      return
+    }
+    const submittedUserId = req.body?.UserId
+    // Reject other owners uniformly, without checking whether the submitted ID exists.
+    if (submittedUserId !== undefined &&
+        ((typeof submittedUserId !== 'number' && typeof submittedUserId !== 'string') ||
+         String(submittedUserId) !== String(user.data.id))) {
+      res.status(403).json({ status: 'error', message: 'Forbidden' })
+      return
+    }
+    next()
+  }, security.appendUserId())
   app.get('/api/PrivacyRequests', security.denyAll())
   app.use('/api/PrivacyRequests/:id', security.denyAll())
 
   app.post('/api/Addresss', security.appendUserId())
   app.get('/api/Addresss', security.appendUserId(), address.getAddress())
-  app.put('/api/Addresss/:id', security.appendUserId())
+  app.put('/api/Addresss/:id', security.appendUserId(), address.updateAddressById())
   app.delete('/api/Addresss/:id', security.appendUserId(), address.delAddressById())
   app.get('/api/Addresss/:id', security.appendUserId(), address.getAddressById())
   app.get('/api/Deliverys', delivery.getDeliveryMethods())

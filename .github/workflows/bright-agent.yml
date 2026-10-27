@@ -39,7 +39,28 @@ on:
     types: [opened, synchronize, reopened]
   issue_comment:
     types: [created]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      scan_mode:
+        description: "Scan mode for this manual run"
+        required: true
+        default: "full-auth"
+        type: choice
+        options:
+          # functional       → RUN_MODE=function: skip full app startup, wrap
+          #                     security-critical functions in an HTTP harness and
+          #                     scan those. No live app, no auth needed.
+          - functional
+          # full-auth         → RUN_MODE=full with BRIGHT_AUTH_STUB=off: boot the
+          #                     real app and scan live routes using ONLY a real
+          #                     login (no auth-stub fallback).
+          - full-auth
+          # full-auth-stub    → RUN_MODE=full with BRIGHT_AUTH_STUB=on: boot the
+          #                     real app and force the auth-stub (transiently patch
+          #                     the credential check so a secret X-Bright-Principal
+          #                     header authenticates as a real privileged user —
+          #                     authentication only, reverted and never committed).
+          - full-auth-stub
 
 # contents: write     → commit fixes onto the (PR head or scan) branch
 # pull-requests: write → open/update the PR + summary comment + reactions
@@ -166,6 +187,21 @@ jobs:
           # the scan to the diff. Set SCAN_SCOPE=changed to force diff-only
           # (bails on docs-only PRs) or SCAN_SCOPE=full to force a full scan.
           # SCAN_SCOPE: changed
+          # --- Scan mode (workflow_dispatch only) ---
+          # The `scan_mode` input selects RUN_MODE + BRIGHT_AUTH_STUB:
+          #   functional     → RUN_MODE=function
+          #   full-auth      → RUN_MODE=full,     BRIGHT_AUTH_STUB=off
+          #   full-auth-stub → RUN_MODE=full,     BRIGHT_AUTH_STUB=on
+          # On pull_request / issue_comment the input is empty, so both stay unset
+          # and the agent uses its own defaults (RUN_MODE=full, auth stub=auto).
+          RUN_MODE: >-
+            ${{ (inputs.scan_mode == 'functional' && 'function')
+              || ((inputs.scan_mode == 'full-auth' || inputs.scan_mode == 'full-auth-stub') && 'full')
+              || '' }}
+          BRIGHT_AUTH_STUB: >-
+            ${{ (inputs.scan_mode == 'full-auth-stub' && 'on')
+              || (inputs.scan_mode == 'full-auth' && 'off')
+              || '' }}
           # --- Detailed stats & diagnostics ---
           BRIGHT_DEBUG: "1"
           BRIGHT_DUMP_TURNS: "1"

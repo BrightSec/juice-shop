@@ -464,7 +464,22 @@ restoreOverwrittenFilesWithOriginals().then(() => {
   app.delete('/api/Cards/:id', security.appendUserId(), payment.delPaymentMethodById())
   app.get('/api/Cards/:id', security.appendUserId(), payment.getPaymentMethodById())
   /* PrivacyRequests: Only POST allowed for authenticated users */
-  app.post('/api/PrivacyRequests', security.isAuthorized(), security.appendUserId())
+  app.post('/api/PrivacyRequests', security.isAuthorized(), (req: Request, res: Response, next: NextFunction) => {
+    const user = security.authenticatedUsers.get(utils.jwtFrom(req))
+    if (!user?.data?.id) {
+      res.status(401).json({ status: 'error', message: 'Unauthorized' })
+      return
+    }
+    const submittedUserId = req.body?.UserId
+    // Reject other owners uniformly, without checking whether the submitted ID exists.
+    if (submittedUserId !== undefined &&
+        ((typeof submittedUserId !== 'number' && typeof submittedUserId !== 'string') ||
+         String(submittedUserId) !== String(user.data.id))) {
+      res.status(403).json({ status: 'error', message: 'Forbidden' })
+      return
+    }
+    next()
+  }, security.appendUserId())
   app.get('/api/PrivacyRequests', security.denyAll())
   app.use('/api/PrivacyRequests/:id', security.denyAll())
 
